@@ -1,4 +1,4 @@
-package repostore
+package commit
 
 import (
 	"context"
@@ -15,56 +15,36 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// PulpCommit relates to the storage of a commit tarfile in Pulp
-type PulpCommit struct {
-	OrgID      string
-	SourceURL  string
-	Domain     *pulpDomain
-	FileRepo   *pulpFileRepository
-	OSTreeRepo *pulpOSTreeRepository
-}
-
 // Store imports an OSTree repo into Pulp
-func (pc *PulpCommit) Store(ctx context.Context, commit models.Commit, edgeRepo *models.Repo) error {
-
-	// create a domain with a pre-defined name
-	pc.Domain = &pulpDomain{
-		Name: fmt.Sprintf("em%sd", commit.OrgID),
-	}
-	derr := pc.Domain.Create(ctx)
-	if derr != nil {
-		return derr
+func Store(ctx context.Context, orgID string, edgeRepoID uint, sourceURL string) error {
+	// create a domain with the Org ID
+	domainName, err := domainCreate(ctx, orgID)
+	if err != nil {
+		return err
 	}
 
 	// get a pulp service based on the specific domain
-	pserv, err := pulp.NewPulpServiceWithDomain(ctx, pc.Domain.Name)
+	pserv, err := pulp.NewPulpServiceWithDomain(ctx, domainName)
 	if err != nil {
 		return err
 	}
 
 	// Import the commit tarfile into an initial Pulp file repo
-	pc.FileRepo = &pulpFileRepository{}
-	if err = pc.FileRepo.Import(ctx, pserv, pc.SourceURL); err != nil {
+	fileRepo, err := fileRepoImport(ctx, pserv, sourceURL)
+	if err != nil {
 		log.WithContext(ctx).Error("Error importing tarfile to initial pulp file repository")
 		return err
 	}
-	log.WithContext(ctx).WithFields(log.Fields{
-		"artifact": pc.FileRepo.artifact,
-		"version":  pc.FileRepo.version,
-	}).Info("Pulp artifact uploaded")
-
 	// create an OSTree repository in Pulp
 	// TODO: check for an existing OSTree repo for image commit versions > 1 and add the commit
-	pc.OSTreeRepo = &pulpOSTreeRepository{
-		Name: fmt.Sprintf("repo-%s-%d", commit.OrgID, edgeRepo.ID),
-	}
-	if err = pc.OSTreeRepo.Create(ctx, pserv, pc.OrgID); err != nil {
+	ostreeRepoName, pulpHref, err := ostreeRepoCreate(ctx, pserv, orgID, edgeRepoID)
+	if err != nil {
 		log.WithContext(ctx).Error("Error creating pulp ostree repository")
 		return err
 	}
 	log.WithContext(ctx).Info("Pulp OSTree Repo created with Content Guard and Distribution")
 
-	if err = pc.OSTreeRepo.Import(ctx, pserv, pc.OSTreeRepo.Name, edgeRepo, *pc.FileRepo); err != nil {
+	if err := ostreeRepoImport(ctx, pserv, ostreeRepoName, pulpHref, sourceURL, fileRepo); err != nil {
 		log.WithContext(ctx).Error("Error importing tarfile into pulp ostree repository")
 
 		return err
@@ -74,58 +54,48 @@ func (pc *PulpCommit) Store(ctx context.Context, commit models.Commit, edgeRepo 
 	return nil
 }
 
-type pulpDomain struct {
-	Name string
-	UUID uuid.UUID
-}
-
 // Create creates a domain for a specific org if one does not already exist
-func (pd *pulpDomain) Create(ctx context.Context) error {
+func domainCreate(ctx context.Context, orgID string) (string, error) {
+	name := fmt.Sprintf("em%sd", orgID)
 	pulpDefaultService, err := pulp.NewPulpServiceDefaultDomain(ctx)
 	if err != nil {
-		return err
+		return name, err
 	}
 
-	domains, err := pulpDefaultService.DomainsList(ctx, pd.Name)
+	domains, err := pulpDefaultService.DomainsList(ctx, name)
 	if err != nil {
 		log.WithContext(ctx).WithFields(log.Fields{
-			"domain_name": pd.Name,
+			"domain_name": name,
 			"error":       err.Error(),
 		}).Error("Error listing pulp domains")
-		return err
+		return name, err
 	}
 
 	if len(domains) > 1 {
 		log.WithContext(ctx).WithFields(log.Fields{
-			"name":    pd.Name,
+			"name":    name,
 			"domains": domains,
 		}).Error("More than one domain matches name")
-		return errors.New("More than one domain matches name")
+		return name, errors.New("More than one domain matches name")
 	}
 
 	if len(domains) == 0 {
-		createdDomain, err := pulpDefaultService.DomainsCreate(ctx, pd.Name)
+		createdDomain, err := pulpDefaultService.DomainsCreate(ctx, name)
 		if err != nil {
 			log.WithContext(ctx).WithField("error", err.Error()).Error("Error creating pulp domain")
-			return err
+			return name, err
 		}
 
-		pd.UUID = pulp.ScanUUID(createdDomain.PulpHref)
+		domainUUID := pulp.ScanUUID(createdDomain.PulpHref)
 
 		log.WithContext(ctx).WithFields(log.Fields{
 			"domain_name": createdDomain.Name,
 			"domain_href": createdDomain.PulpHref,
-			"domain_uuid": pd.UUID,
+			"domain_uuid": domainUUID,
 		}).Info("Created new pulp domain")
 	}
 
-	return nil
-}
-
-type pulpFileRepository struct {
-	repo     string
-	artifact string
-	version  string
+	return name, nil
 }
 
 type pulpFileRepoImporter interface {
@@ -133,31 +103,31 @@ type pulpFileRepoImporter interface {
 	FileRepositoriesImport(context.Context, string, string) (string, string, error)
 }
 
-func (pfr *pulpFileRepository) Import(ctx context.Context, pulpService pulpFileRepoImporter, sourceURL string) error {
-
-	// get the file repo to initially push the tar artifact
-	var err error
-	pfr.repo, err = pulpService.FileRepositoriesEnsure(ctx)
-	if err != nil {
-		return err
-	}
-
-	log.WithContext(ctx).Info("File repo found or created: ", pfr.repo)
-
-	pfr.artifact, pfr.version, err = pulpService.FileRepositoriesImport(ctx, pfr.repo, sourceURL)
-	if err != nil {
-		return err
-	}
-
-	return nil
+type fileRepo struct {
+	name     string
+	artifact string
+	version  string
 }
 
-type pulpOSTreeRepository struct {
-	ID           uint
-	Name         string
-	CGPulpHref   string
-	PulpHref     string
-	Distribution *pulp.OstreeOstreeDistributionResponse
+func fileRepoImport(ctx context.Context, pulpService pulpFileRepoImporter, sourceURL string) (fileRepo, error) {
+	// get the file repo to initially push the tar artifact
+	repo, err := pulpService.FileRepositoriesEnsure(ctx)
+	if err != nil {
+		return fileRepo{}, err
+	}
+
+	log.WithContext(ctx).Info("File repo found or created: ", repo)
+
+	artifact, version, err := pulpService.FileRepositoriesImport(ctx, repo, sourceURL)
+	if err != nil {
+		return fileRepo{}, err
+	}
+	log.WithContext(ctx).WithFields(log.Fields{
+		"artifact": artifact,
+		"version":  version,
+	}).Info("Pulp artifact uploaded")
+
+	return fileRepo{repo, artifact, version}, nil
 }
 
 type pulpOSTreeRepositoryCreator interface {
@@ -167,45 +137,45 @@ type pulpOSTreeRepositoryCreator interface {
 }
 
 // Create creates a new Pulp OSTree repository for a commit
-func (pr *pulpOSTreeRepository) Create(ctx context.Context, pulpService pulpOSTreeRepositoryCreator, orgID string) error {
+func ostreeRepoCreate(ctx context.Context, pulpService pulpOSTreeRepositoryCreator, orgID string, edgeRepoID uint) (string, string, error) {
+	repoName := fmt.Sprintf("repo-%s-%d", orgID, edgeRepoID)
 
-	pulpRepo, err := pulpService.RepositoriesCreate(ctx, pr.Name)
+	pulpRepo, err := pulpService.RepositoriesCreate(ctx, repoName)
 	if err != nil {
-		return err
+		return repoName, "", err
 	}
-	pr.PulpHref = *pulpRepo.PulpHref
-	log.WithContext(ctx).WithField("pulp_href", pr.PulpHref).Info("Pulp Repository created")
+	pulpHref := *pulpRepo.PulpHref
+	log.WithContext(ctx).WithField("pulp_href", pulpHref).Info("Pulp Repository created")
 
 	cg, err := pulpService.ContentGuardEnsure(ctx, orgID)
 	if err != nil {
-		return err
+		return repoName, pulpHref, err
 	}
-	pr.CGPulpHref = *cg.PulpHref
+	cgPulpHref := *cg.PulpHref
 	log.WithContext(ctx).WithFields(log.Fields{
-		"contentguard_href": pr.CGPulpHref,
+		"contentguard_href": cgPulpHref,
 		"contentguard_0":    (*cg.Guards)[0],
 		"contentguard_1":    (*cg.Guards)[1],
 	}).Info("Pulp Content Guard found or created")
 
-	pr.Distribution, err = pulpService.DistributionsCreate(ctx, pr.Name, pr.Name, *pulpRepo.PulpHref, *cg.PulpHref)
+	distribution, err := pulpService.DistributionsCreate(ctx, repoName, repoName, pulpHref, cgPulpHref)
 	if err != nil {
-		return err
+		return repoName, pulpHref, err
 	}
 	log.WithContext(ctx).WithFields(log.Fields{
-		"name":      pr.Distribution.Name,
-		"base_path": pr.Distribution.BasePath,
-		"base_url":  pr.Distribution.BaseUrl,
-		"pulp_href": pr.Distribution.PulpHref,
+		"name":      distribution.Name,
+		"base_path": distribution.BasePath,
+		"base_url":  distribution.BaseUrl,
+		"pulp_href": distribution.PulpHref,
 	}).Info("Pulp Distribution created")
 
-	return nil
+	return repoName, pulpHref, nil
 }
 
 // DistributionURL returns the password embedded distribution URL for a specific repo
-func (pr *pulpOSTreeRepository) DistributionURL(ctx context.Context, domain string, repoName string) (string, error) {
+func distributionURL(ctx context.Context, distBaseURL string, domain string, repoName string) (string, error) {
 	cfg := config.Get()
 
-	distBaseURL := *pr.Distribution.BaseUrl
 	prodDistURL, err := url.Parse(distBaseURL)
 	if err != nil {
 		return "", errors.New("Unable to set user:password for Pulp distribution URL")
@@ -238,32 +208,29 @@ type pulpOSTreeRepositoryImporter interface {
 }
 
 // Import imports an artifact into the repo and deletes the tarfile artifact
-func (pr *pulpOSTreeRepository) Import(ctx context.Context, pulpService pulpOSTreeRepositoryImporter, pulpRepoName string, edgeRepo *models.Repo, fileRepo pulpFileRepository) error {
+func ostreeRepoImport(ctx context.Context, pulpService pulpOSTreeRepositoryImporter, pulpRepoName string, pulpHref string, baseEdgeRepoURL string, fileRepo fileRepo) error {
 	log.WithContext(ctx).Debug("Starting tarfile import into Pulp OSTree repository")
-	repoImported, err := pulpService.RepositoriesImport(ctx, pulp.ScanUUID(&pr.PulpHref), "repo", fileRepo.artifact)
+	repoImported, err := pulpService.RepositoriesImport(ctx, pulp.ScanUUID(&pulpHref), "repo", fileRepo.artifact)
 	if err != nil {
 		return err
 	}
 	log.WithContext(ctx).Info("Repository imported", *repoImported.PulpHref)
 
-	edgeRepo.URL, err = pr.DistributionURL(ctx, pulpService.Domain(), pulpRepoName)
+	defer func() {
+		if err := pulpService.FileRepositoriesVersionDelete(ctx, pulp.ScanUUID(&fileRepo.version), pulp.ScanRepoFileVersion(&fileRepo.version)); err == nil {
+			log.WithContext(ctx).Info("Artifact version deleted", fileRepo.version)
+		}
+	}()
+
+	edgeRepoURL, err := distributionURL(ctx, baseEdgeRepoURL, pulpService.Domain(), pulpRepoName)
 	if err != nil {
 		log.WithContext(ctx).WithField("error", err.Error()).Error("Error getting distibution URL for Pulp repo")
 	}
 
-	// TODO: move this to parallel or end of entire process (post Installer if requested)
-	err = pulpService.FileRepositoriesVersionDelete(ctx, pulp.ScanUUID(&fileRepo.version), pulp.ScanRepoFileVersion(&fileRepo.version))
-	if err != nil {
-		return err
-	}
-	log.WithContext(ctx).Info("Artifact version deleted", fileRepo.version)
-
-	edgeRepo.Status = models.RepoStatusSuccess
-
-	edgeRepoURL, _ := url.Parse(edgeRepo.URL)
+	parsedEdgeRepoURL, _ := url.Parse(edgeRepoURL)
 	log.WithContext(ctx).WithFields(log.Fields{
-		"status":                edgeRepo.Status,
-		"repo_distribution_url": edgeRepoURL.Redacted(),
+		"status":                models.RepoStatusSuccess,
+		"repo_distribution_url": parsedEdgeRepoURL.Redacted(),
 	}).Debug("Repo import into Pulp complete")
 
 	return nil

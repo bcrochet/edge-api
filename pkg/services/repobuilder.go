@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +15,7 @@ import (
 	"github.com/redhatinsights/edge-api/config"
 	"github.com/redhatinsights/edge-api/pkg/db"
 	"github.com/redhatinsights/edge-api/pkg/models"
-	commit "github.com/redhatinsights/edge-api/pkg/services/internal"
+	"github.com/redhatinsights/edge-api/pkg/services/internal/commit"
 	feature "github.com/redhatinsights/edge-api/unleash/features"
 
 	"github.com/cavaliercoder/grab"
@@ -85,7 +84,8 @@ func (rb *RepoBuilder) BuildUpdateRepo(id uint) (*models.UpdateTransaction, erro
 
 	rb.log = rb.log.WithFields(log.Fields{
 		"to_commit_id": update.Commit.ID,
-		"update_id":    update.ID})
+		"update_id":    update.ID,
+	})
 
 	if update.Repo == nil {
 		rb.log.Error("Repo is unavailable")
@@ -188,7 +188,8 @@ func (rb *RepoBuilder) BuildUpdateRepo(id uint) (*models.UpdateTransaction, erro
 		}
 		rb.log.WithFields(log.Fields{
 			"updateID":   update.ID,
-			"OldCommits": len(update.OldCommits)}).
+			"OldCommits": len(update.OldCommits),
+		}).
 			Info("Old commits found to this commit")
 
 		err = rb.CommitTarDelete(tarFileName)
@@ -231,7 +232,8 @@ func (rb *RepoBuilder) BuildUpdateRepo(id uint) (*models.UpdateTransaction, erro
 			rb.log.WithFields(log.Fields{
 				"updateID":            update.ID,
 				"commit.OSTreeCommit": commit.OSTreeCommit,
-				"OldCommits":          commit.ID}).
+				"OldCommits":          commit.ID,
+			}).
 				Info("Calculate diff from previous commit")
 			commit := commit // this will prevent implicit memory aliasing in the loop
 			stageCommitPath := filepath.Clean(filepath.Join(stagePath, commit.OSTreeCommit))
@@ -378,12 +380,7 @@ func (rb *RepoBuilder) StoreRepo(ctx context.Context, repo *models.Repo) (*model
 		return nil, cmtDB.Error
 	}
 
-	pulpCommit := commit.PulpCommit{
-		OrgID:     cmt.OrgID,
-		SourceURL: cmt.ImageBuildTarURL,
-	}
-
-	if err := pulpCommit.Store(ctx, cmt, repo); err != nil {
+	if err := commit.Store(ctx, cmt.OrgID, repo.ID, cmt.ImageBuildTarURL); err != nil {
 		log.WithContext(ctx).WithField("error", err.Error()).Error("Error storing Image Builder commit in Pulp OSTree repo")
 	}
 
@@ -526,7 +523,6 @@ func (rb *RepoBuilder) uploadTarRepo(orgID, imageName string, repoID int) (strin
 	uploadPath := fmt.Sprintf("v2/%s/tar/%v/%s", orgID, repoID, imageName)
 	uploadPath = filepath.Clean(uploadPath)
 	url, err := rb.FilesService.GetUploader().UploadFile(imageName, uploadPath)
-
 	if err != nil {
 		return "error", fmt.Errorf("error uploading the Tar :: %s :: %s", uploadPath, err.Error())
 	}
@@ -735,7 +731,6 @@ func RepoRevParse(path string, ref string) (string, error) {
 	cmd.Stdout = &res
 
 	err := cmd.Run()
-
 	if err != nil {
 		return "", err
 	}
